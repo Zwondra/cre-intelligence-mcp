@@ -33,6 +33,7 @@ Zero data licensing fees. Zero hallucinations on financial inputs.
 | `get_inflation_data` | CPI, shelter inflation, rent CPI + DCF rent growth guidance | FRED |
 | `get_cre_market_data` | CRE price index, C&I loan trends, delinquency rates, credit spreads | FRED |
 | `get_market_demographics` | Median income, employment, vacancy, rents for any US address | Census Bureau |
+| `get_radius_demographics` | 1/3/5-mile trade-area rings: population, weighted income, renter share, rents | Census Bureau |
 | `analyze_rent_roll` | Paste PDF text → structured JSON: tenant, SF, rent, dates, expirations | Claude AI |
 | `abstract_lease` | Paste lease text → term, rent schedule, TI, options, red flags | Claude AI |
 | `flag_lease_risks` | Rent roll JSON → rollover risk, concentration risk, due diligence checklist | Claude AI |
