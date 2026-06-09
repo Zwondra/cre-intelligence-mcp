@@ -13,6 +13,8 @@ No data licensing fees. Every number comes from verified public sources.
 from fastmcp import FastMCP
 from dotenv import load_dotenv
 from typing import Optional
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 import anthropic
 import requests
 import json
@@ -854,6 +856,13 @@ Bulleted list of 3-5 specific risks for this deal.
 Keep it tight and professional. Every statistic must come from the provided data."""
 
     return ask_claude(deal_data, instructions, max_tokens=2500)
+
+
+# ─── Health check ─────────────────────────────────────────────────────────────
+
+@mcp.custom_route("/health", methods=["GET", "HEAD"])
+async def health_check(request: Request) -> JSONResponse:
+    return JSONResponse({"status": "ok", "service": "CRE Intelligence MCP"})
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
