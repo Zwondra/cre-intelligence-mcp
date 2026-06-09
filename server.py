@@ -183,17 +183,26 @@ def get_market_demographics(address: str) -> dict:
 
     # Step 1: Geocode via Census Geocoder
     try:
+        # Extract state and optional zip from "ST ZIPCODE" or just "ST"
+        state_parts = state_zip.split()
+        state_code = state_parts[0][:2]
+        zip_code = state_parts[1] if len(state_parts) > 1 else ""
+
+        geo_params = {
+            "street": street,
+            "city": city,
+            "state": state_code,
+            "benchmark": "Public_AR_Census2020",
+            "vintage": "Census2020_Census2020",
+            "layers": "all",
+            "format": "json"
+        }
+        if zip_code:
+            geo_params["zip"] = zip_code
+
         geo_r = requests.get(
             "https://geocoding.geo.census.gov/geocoder/geographies/address",
-            params={
-                "street": street,
-                "city": city,
-                "state": state_zip[:2],
-                "benchmark": "Public_AR_Census2020",
-                "vintage": "Census2020_Census2020",
-                "layers": "10",
-                "format": "json"
-            },
+            params=geo_params,
             timeout=15
         )
         geo_data = geo_r.json()
@@ -240,6 +249,10 @@ def get_market_demographics(address: str) -> dict:
             return None if n < 0 else n
         except:
             return None
+
+    census_key = os.getenv("CENSUS_API_KEY", "")
+    if not census_key:
+        return {"error": "CENSUS_API_KEY not set. Free key at api.census.gov/data/key_signup.html"}
 
     # Try most recent ACS first, fall back if needed
     for acs_year in ["2023", "2022"]:
@@ -846,4 +859,10 @@ Keep it tight and professional. Every statistic must come from the provided data
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    mcp.run()
+    port = int(os.getenv("PORT", 0))
+    if port:
+        # Remote deployment (Railway, Fly.io, etc.) — HTTP transport
+        mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
+    else:
+        # Local Claude Desktop — stdio transport
+        mcp.run()
