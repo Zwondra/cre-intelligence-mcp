@@ -38,6 +38,7 @@ mcp = FastMCP(
     All demographic data comes from the US Census Bureau — never estimate demographics.
     Always use get_current_rates() before building any DCF model.
     Always use get_market_demographics() when analyzing a specific property location.
+    Use get_radius_demographics() for 1/3/5-mile trade-area analysis around a property.
     """
 )
 
@@ -99,6 +100,73 @@ def parse_json_from_claude(text: str) -> dict:
     if match:
         return json.loads(match.group())
     raise ValueError("No JSON object found in response")
+
+
+# ─── Geo helpers ──────────────────────────────────────────────────────────────
+
+def geocode_address(address: str) -> dict:
+    """Geocode a US address via the Census Geocoder.
+    Returns matched address, lat/lng, and tract FIPS codes — or {'error': ...}."""
+    parts = [p.strip() for p in address.split(",")]
+    if len(parts) < 3:
+        return {"error": "Provide full address: '123 Main St, City, ST 12345'"}
+
+    street, city, state_zip = parts[0], parts[1], parts[2]
+
+    try:
+        # Extract state and optional zip from "ST ZIPCODE" or just "ST"
+        state_parts = state_zip.split()
+        state_code = state_parts[0][:2]
+        zip_code = state_parts[1] if len(state_parts) > 1 else ""
+
+        geo_params = {
+            "street": street,
+            "city": city,
+            "state": state_code,
+            "benchmark": "Public_AR_Census2020",
+            "vintage": "Census2020_Census2020",
+            "layers": "all",
+            "format": "json"
+        }
+        if zip_code:
+            geo_params["zip"] = zip_code
+
+        geo_r = requests.get(
+            "https://geocoding.geo.census.gov/geocoder/geographies/address",
+            params=geo_params,
+            timeout=15
+        )
+        matches = geo_r.json().get("result", {}).get("addressMatches", [])
+
+        if not matches:
+            return {"error": f"Could not geocode: '{address}'. Try including ZIP code."}
+
+        match = matches[0]
+        tracts = match.get("geographies", {}).get("Census Tracts", [])
+        if not tracts:
+            return {"error": "No census tract found for this address."}
+
+        tract = tracts[0]
+        coords = match.get("coordinates", {})
+        return {
+            "matched_address": match.get("matchedAddress", address),
+            "lat": coords.get("y"),
+            "lng": coords.get("x"),
+            "state_fips": tract["STATE"],
+            "county_fips": tract["COUNTY"],
+            "tract_fips": tract["TRACT"],
+        }
+    except Exception as e:
+        return {"error": f"Geocoding failed: {str(e)}"}
+
+
+def _haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance between two points, in miles."""
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlam / 2) ** 2
+    return 2 * 3958.7613 * math.asin(math.sqrt(a))
 
 
 # ─── Tool 1: Live Interest Rates ──────────────────────────────────────────────
@@ -171,65 +239,19 @@ def get_market_demographics(address: str) -> dict:
 
     This is address-specific data from the actual Census tract — not estimates.
     Claude cannot access this without the MCP.
+    For 1/3/5-mile trade-area rings, use get_radius_demographics instead.
 
     Args:
         address: Full US property address (e.g. "1234 Main St, Charlotte, NC 28202")
     """
-    # Parse address parts
-    parts = [p.strip() for p in address.split(",")]
-    if len(parts) < 3:
-        return {"error": "Provide full address: '123 Main St, City, ST 12345'"}
-
-    street = parts[0]
-    city = parts[1]
-    state_zip = parts[2]
-
     # Step 1: Geocode via Census Geocoder
-    try:
-        # Extract state and optional zip from "ST ZIPCODE" or just "ST"
-        state_parts = state_zip.split()
-        state_code = state_parts[0][:2]
-        zip_code = state_parts[1] if len(state_parts) > 1 else ""
+    geo = geocode_address(address)
+    if "error" in geo:
+        return geo
 
-        geo_params = {
-            "street": street,
-            "city": city,
-            "state": state_code,
-            "benchmark": "Public_AR_Census2020",
-            "vintage": "Census2020_Census2020",
-            "layers": "all",
-            "format": "json"
-        }
-        if zip_code:
-            geo_params["zip"] = zip_code
-
-        geo_r = requests.get(
-            "https://geocoding.geo.census.gov/geocoder/geographies/address",
-            params=geo_params,
-            timeout=15
-        )
-        geo_data = geo_r.json()
-        matches = geo_data.get("result", {}).get("addressMatches", [])
-
-        if not matches:
-            return {"error": f"Could not geocode: '{address}'. Try including ZIP code."}
-
-        match = matches[0]
-        geographies = match.get("geographies", {})
-        tracts  = geographies.get("Census Tracts", [])
-        counties = geographies.get("Counties", [])
-
-        if not tracts:
-            return {"error": "No census tract found for this address."}
-
-        tract   = tracts[0]
-        state_fips  = tract["STATE"]
-        county_fips = tract["COUNTY"]
-        tract_fips  = tract["TRACT"]
-        coords  = match.get("coordinates", {})
-
-    except Exception as e:
-        return {"error": f"Geocoding failed: {str(e)}"}
+    state_fips  = geo["state_fips"]
+    county_fips = geo["county_fips"]
+    tract_fips  = geo["tract_fips"]
 
     # Step 2: Pull ACS 5-year data
     variables = {
@@ -298,8 +320,8 @@ def get_market_demographics(address: str) -> dict:
             contract_rent = safe_int(raw.get("B25058_001E"))
 
             return {
-                "address_matched": match.get("matchedAddress", address),
-                "coordinates": {"lat": coords.get("y"), "lng": coords.get("x")},
+                "address_matched": geo["matched_address"],
+                "coordinates": {"lat": geo["lat"], "lng": geo["lng"]},
                 "census_tract": f"{state_fips}-{county_fips}-{tract_fips}",
                 "acs_vintage": acs_year,
                 "demographics": {
@@ -325,6 +347,217 @@ def get_market_demographics(address: str) -> dict:
             continue
 
     return {"error": "Census ACS data unavailable for this location. Try a more specific address."}
+
+
+# ─── Tool 2b: Radius Demographics (1/3/5-mile rings) ─────────────────────────
+
+RADIUS_ACS_VARS = {
+    "B19013_001E": "median_household_income",
+    "B01003_001E": "total_population",
+    "B23025_004E": "employed_civilians",
+    "B23025_003E": "civilian_labor_force",
+    "B25001_001E": "total_housing_units",
+    "B25002_002E": "occupied_housing_units",
+    "B25002_003E": "vacant_housing_units",
+    "B25064_001E": "median_gross_rent",
+    "B15003_022E": "bachelors_degree",
+    "B15003_001E": "education_population_total",
+    "B25003_001E": "tenure_total",
+    "B25003_003E": "renter_occupied",
+}
+
+
+@mcp.tool()
+def get_radius_demographics(address: str, radii_miles: str = "1,3,5") -> dict:
+    """
+    Get aggregated Census demographics for radius rings around a US property address —
+    the standard 1/3/5-mile trade-area format used in CRE site analysis.
+    Aggregates every census tract whose centroid falls within each radius:
+    population, household-weighted median income, employment rate, college attainment,
+    housing vacancy, renter share, and median rent.
+
+    Use this for trade-area / site analysis. Use get_market_demographics for the
+    single census tract immediately around the address.
+
+    Args:
+        address:     Full US property address (e.g. "1234 Main St, Charlotte, NC 28202")
+        radii_miles: Comma-separated radii in miles (default "1,3,5", each capped at 15)
+    """
+    census_key = os.getenv("CENSUS_API_KEY", "")
+    if not census_key:
+        return {"error": "CENSUS_API_KEY not set. Free key at api.census.gov/data/key_signup.html"}
+
+    try:
+        radii = sorted({min(float(r.strip()), 15.0) for r in radii_miles.split(",") if float(r.strip()) > 0})[:4]
+    except Exception:
+        return {"error": "radii_miles must be comma-separated numbers, e.g. '1,3,5'"}
+    if not radii:
+        return {"error": "No valid radii provided."}
+
+    geo = geocode_address(address)
+    if "error" in geo:
+        return geo
+    lat, lng = geo["lat"], geo["lng"]
+
+    # Step 1: All tracts intersecting the largest circle (TIGERweb, 2020 tract vintage)
+    try:
+        feats = []
+        offset = 0
+        while True:
+            r = requests.get(
+                "https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/Tracts_Blocks/MapServer/10/query",
+                params={
+                    "geometry": f"{lng},{lat}",
+                    "geometryType": "esriGeometryPoint",
+                    "inSR": "4326",
+                    "spatialRel": "esriSpatialRelIntersects",
+                    "distance": radii[-1] * 1609.344,
+                    "units": "esriSRUnit_Meter",
+                    "outFields": "GEOID,STATE,COUNTY,TRACT,CENTLAT,CENTLON",
+                    "returnGeometry": "false",
+                    "resultOffset": offset,
+                    "f": "json",
+                },
+                timeout=20,
+            )
+            d = r.json()
+            batch = d.get("features", [])
+            feats.extend(batch)
+            if d.get("exceededTransferLimit") and batch:
+                offset += len(batch)
+            else:
+                break
+    except Exception as e:
+        return {"error": f"Tract lookup failed: {str(e)}"}
+
+    if not feats:
+        return {"error": "No census tracts found around this address."}
+
+    tracts = []
+    for f in feats:
+        a = f.get("attributes", {})
+        try:
+            clat, clon = float(a["CENTLAT"]), float(a["CENTLON"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        tracts.append({
+            "state": a["STATE"], "county": a["COUNTY"], "tract": a["TRACT"],
+            "dist": _haversine_miles(lat, lng, clat, clon),
+        })
+
+    # Step 2: Batch ACS pull — one call per county covered by the largest ring
+    counties = sorted({(t["state"], t["county"]) for t in tracts})
+    acs_by_tract, acs_vintage = {}, None
+    for acs_year in ["2023", "2022"]:
+        try:
+            tmp, ok = {}, True
+            for st, co in counties:
+                resp = requests.get(
+                    f"https://api.census.gov/data/{acs_year}/acs/acs5",
+                    params={
+                        "get": ",".join(RADIUS_ACS_VARS.keys()),
+                        "for": "tract:*",
+                        "in": f"state:{st} county:{co}",
+                        "key": census_key,
+                    },
+                    timeout=20,
+                )
+                if resp.status_code != 200:
+                    ok = False
+                    break
+                rows = resp.json()
+                hdr = rows[0]
+                for row in rows[1:]:
+                    rec = dict(zip(hdr, row))
+                    tmp[(rec["state"], rec["county"], rec["tract"])] = rec
+            if ok and tmp:
+                acs_by_tract, acs_vintage = tmp, acs_year
+                break
+        except Exception:
+            continue
+
+    if not acs_by_tract:
+        return {"error": "Census ACS data unavailable for this area."}
+
+    def _i(rec, var):
+        try:
+            n = int(rec.get(var))
+            return None if n < 0 else n  # Census uses negative sentinels for suppressed data
+        except (TypeError, ValueError):
+            return None
+
+    # Step 3: Aggregate per ring
+    rings = {}
+    for radius in radii:
+        in_ring = [t for t in tracts if t["dist"] <= radius]
+        ring_note = None
+        if not in_ring:
+            in_ring = [min(tracts, key=lambda t: t["dist"])]
+            ring_note = "No tract centroid within radius — using nearest tract (rural area)."
+
+        recs = []
+        for t in in_ring:
+            rec = acs_by_tract.get((t["state"], t["county"], t["tract"]))
+            if rec:
+                recs.append(rec)
+
+        def ssum(var):
+            vals = [v for v in (_i(r, var) for r in recs) if v is not None]
+            return sum(vals) if vals else None
+
+        def wmedian(value_var, weight_var):
+            num = den = 0
+            for rec in recs:
+                v, w = _i(rec, value_var), _i(rec, weight_var)
+                if v is not None and w:
+                    num += v * w
+                    den += w
+            return round(num / den) if den else None
+
+        pop      = ssum("B01003_001E")
+        employed = ssum("B23025_004E")
+        labor    = ssum("B23025_003E")
+        bach     = ssum("B15003_022E")
+        edu      = ssum("B15003_001E")
+        units    = ssum("B25001_001E")
+        occ      = ssum("B25002_002E")
+        vac      = ssum("B25002_003E")
+        tenure   = ssum("B25003_001E")
+        renters  = ssum("B25003_003E")
+
+        ring = {
+            "radius_miles": radius,
+            "tract_count": len(recs),
+            "population": pop,
+            "median_household_income": wmedian("B19013_001E", "B25002_002E"),
+            "employment_rate_pct": round(employed / labor * 100, 1) if employed and labor else None,
+            "college_educated_pct": round(bach / edu * 100, 1) if bach and edu else None,
+            "housing": {
+                "total_units": units,
+                "occupied_units": occ,
+                "vacant_units": vac,
+                "vacancy_rate_pct": round(vac / units * 100, 1) if vac and units else None,
+                "renter_share_pct": round(renters / tenure * 100, 1) if renters and tenure else None,
+            },
+            "median_gross_rent": wmedian("B25064_001E", "B25003_003E"),
+        }
+        if ring_note:
+            ring["note"] = ring_note
+        rings[f"{radius:g}_mile"] = ring
+
+    return {
+        "address_matched": geo["matched_address"],
+        "coordinates": {"lat": lat, "lng": lng},
+        "acs_vintage": acs_vintage,
+        "rings": rings,
+        "methodology": (
+            "Each ring aggregates all census tracts whose centroid falls within the radius "
+            "(2020 tract boundaries). Median income and rent are household-weighted averages "
+            "of tract medians — the standard free-data approximation. Verify against a licensed "
+            "demographics provider for institutional reporting."
+        ),
+        "source": "US Census Bureau ACS 5-year + TIGERweb",
+    }
 
 
 # ─── Tool 3: Inflation & Rent Growth Data ────────────────────────────────────
