@@ -13,6 +13,7 @@ No data licensing fees. Every number comes from verified public sources.
 from fastmcp import FastMCP
 from dotenv import load_dotenv
 from typing import Optional
+from datetime import date
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 import anthropic
@@ -118,7 +119,7 @@ def get_current_rates() -> dict:
         "treasury_10yr":  "DGS10",
         "treasury_5yr":   "DGS5",
         "treasury_2yr":   "DGS2",
-        "fed_funds_rate": "FEDFUNDS",
+        "fed_funds_rate": "DFF",
     }
 
     results = {}
@@ -385,8 +386,9 @@ def get_cre_market_data() -> dict:
     """
     series_map = {
         "cre_price_index":       ("BOGZ1FL075035503Q", "CRE Price Index (Fed Flow of Funds)"),
-        "commercial_re_loans":   ("BUSLOANS", "Commercial & Industrial Loans Outstanding"),
-        "mortgage_delinquency":  ("DRSFRMACBS", "Delinquency Rate on CRE Loans"),
+        "cre_loans_outstanding": ("CREACBM027NBOG", "CRE Loans Outstanding, All Commercial Banks"),
+        "commercial_industrial_loans": ("BUSLOANS", "Commercial & Industrial Loans Outstanding"),
+        "cre_delinquency":       ("DRCRELEXFACBS", "Delinquency Rate on CRE Loans (Excl. Farmland)"),
         "credit_spread_bbb":     ("BAMLC0A4CBBB", "BBB Corporate Bond Spread (credit proxy)"),
     }
 
@@ -440,7 +442,7 @@ Return ONLY a valid JSON object with this structure:
       "sf": square footage as number,
       "lease_start": "YYYY-MM or YYYY-MM-DD",
       "lease_end": "YYYY-MM or YYYY-MM-DD",
-      "months_remaining": months from June 2026 to lease end as number,
+      "months_remaining": months from the provided current_date to lease end as number,
       "monthly_rent": number,
       "annual_rent": number,
       "rent_psf_annual": number,
@@ -463,7 +465,7 @@ Return ONLY the JSON. No explanation."""
 
     data = {
         "rent_roll_text": text[:14000],
-        "current_date": "June 2026"
+        "current_date": date.today().strftime("%B %Y")
     }
     if property_name:
         data["property_name"] = property_name
@@ -815,7 +817,7 @@ def generate_deal_memo(
         "dcf_inputs":        dcf.get("inputs"),
         "rent_roll_summary": rent_roll_summary,
         "additional_context": additional_context,
-        "memo_date":         "June 2026"
+        "memo_date":         date.today().strftime("%B %d, %Y")
     }
 
     instructions = """Generate a professional CRE Investment Committee (IC) memo in markdown format.
@@ -825,7 +827,7 @@ Reference actual figures from the live_rates and market_demographics sections.
 
 Structure:
 # [Property Address] — Acquisition Memo
-**Date:** June 2026 | **Type:** [property_type] | **Status:** For Review
+**Date:** [use memo_date from data] | **Type:** [property_type] | **Status:** For Review
 
 ---
 

@@ -87,7 +87,39 @@ Recommendation: GO — subject to rent roll review and comp analysis.
 
 ## Setup
 
-### Prerequisites
+### Option A — Hosted (fastest, no API keys)
+
+Add this to your `claude_desktop_config.json` and restart Claude Desktop:
+
+```json
+{
+  "mcpServers": {
+    "cre-intelligence": {
+      "type": "streamable-http",
+      "url": "https://cre-intelligence-mcp.onrender.com/mcp"
+    }
+  }
+}
+```
+
+If your MCP client only supports stdio servers, use the `mcp-remote` bridge instead:
+
+```json
+{
+  "mcpServers": {
+    "cre-intelligence": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "https://cre-intelligence-mcp.onrender.com/mcp"]
+    }
+  }
+}
+```
+
+Free during beta. All data fetching runs server-side.
+
+### Option B — Self-hosted
+
+#### Prerequisites
 - [Claude Desktop](https://claude.ai/download)
 - Python 3.11+
 - Free API keys (takes ~2 minutes total):
@@ -95,7 +127,7 @@ Recommendation: GO — subject to rent roll review and comp analysis.
   - **Census:** [api.census.gov/data/key_signup.html](https://api.census.gov/data/key_signup.html)
   - **Anthropic:** [console.anthropic.com](https://console.anthropic.com)
 
-### Install
+#### Install
 
 ```bash
 git clone https://github.com/Zwondra/cre-intelligence-mcp
