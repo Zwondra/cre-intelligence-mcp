@@ -1218,7 +1218,7 @@ def _demo_analyze(address: str, noi: float, price: float) -> dict:
             "noi_growth_pct": growth_steps,
             "exit_cap_pct": exit_steps,
             "irr_grid": irr_grid,
-            "base_case": {"exit_cap_pct": exit_steps[1], "noi_growth_pct": 3.0},
+            "base_case": {"exit_cap_pct": exit_steps[2], "noi_growth_pct": 3.0},
         },
         "verdict": verdict,
         "verdict_note": verdict_note,
