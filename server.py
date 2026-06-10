@@ -1108,6 +1108,7 @@ Keep it tight and professional. Every statistic must come from the provided data
 
 _RATE_BUCKET: dict = {}
 _API_CACHE: dict = {}
+_STATS = {"since": time.time(), "analyze": 0, "analyze_point": 0, "ips": set()}
 
 _CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
@@ -1326,6 +1327,8 @@ async def api_analyze(request: Request) -> JSONResponse:
             status_code=400, headers=_CORS_HEADERS,
         )
 
+    _STATS["analyze"] += 1
+    _STATS["ips"].add(client_ip)
     payload = await anyio.to_thread.run_sync(lambda: _demo_analyze(address, noi, price))
     return JSONResponse(payload, status_code=400 if "error" in payload else 200, headers=_CORS_HEADERS)
 
@@ -1359,8 +1362,22 @@ async def api_analyze_point(request: Request) -> JSONResponse:
     if noi <= 0 or price <= 0 or noi >= price:
         return JSONResponse({"error": "NOI must be > 0 and price > NOI."}, status_code=400, headers=_CORS_HEADERS)
 
+    _STATS["analyze_point"] += 1
+    _STATS["ips"].add(client_ip)
     payload = await anyio.to_thread.run_sync(lambda: _demo_analyze_point(lat, lng, noi, price))
     return JSONResponse(payload, status_code=400 if "error" in payload else 200, headers=_CORS_HEADERS)
+
+
+@mcp.custom_route("/api/stats", methods=["GET"])
+async def api_stats(request: Request) -> JSONResponse:
+    hours = (time.time() - _STATS["since"]) / 3600
+    return JSONResponse({
+        "since_hours_ago": round(hours, 1),
+        "demo_analyses_address": _STATS["analyze"],
+        "demo_analyses_map": _STATS["analyze_point"],
+        "unique_visitors_api": len(_STATS["ips"]),
+        "note": "Counts since last server deploy/restart (in-memory). Page views tracked separately in Vercel Analytics.",
+    }, headers=_CORS_HEADERS)
 
 
 # ─── Health check ─────────────────────────────────────────────────────────────
