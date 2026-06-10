@@ -369,38 +369,9 @@ RADIUS_ACS_VARS = {
 }
 
 
-@mcp.tool()
-def get_radius_demographics(address: str, radii_miles: str = "1,3,5") -> dict:
-    """
-    Get aggregated Census demographics for radius rings around a US property address —
-    the standard 1/3/5-mile trade-area format used in CRE site analysis.
-    Aggregates every census tract whose centroid falls within each radius:
-    population, household-weighted median income, employment rate, college attainment,
-    housing vacancy, renter share, and median rent.
-
-    Use this for trade-area / site analysis. Use get_market_demographics for the
-    single census tract immediately around the address.
-
-    Args:
-        address:     Full US property address (e.g. "1234 Main St, Charlotte, NC 28202")
-        radii_miles: Comma-separated radii in miles (default "1,3,5", each capped at 15)
-    """
-    census_key = os.getenv("CENSUS_API_KEY", "")
-    if not census_key:
-        return {"error": "CENSUS_API_KEY not set. Free key at api.census.gov/data/key_signup.html"}
-
-    try:
-        radii = sorted({min(float(r.strip()), 15.0) for r in radii_miles.split(",") if float(r.strip()) > 0})[:4]
-    except Exception:
-        return {"error": "radii_miles must be comma-separated numbers, e.g. '1,3,5'"}
-    if not radii:
-        return {"error": "No valid radii provided."}
-
-    geo = geocode_address(address)
-    if "error" in geo:
-        return geo
-    lat, lng = geo["lat"], geo["lng"]
-
+def _point_radius_demographics(lat: float, lng: float, radii: list, census_key: str) -> dict:
+    """Core ring-aggregation engine: tracts around a point → aggregated ACS demographics.
+    Shared by the get_radius_demographics tool (address) and the map API (coordinates)."""
     # Step 1: All tracts intersecting the largest circle (TIGERweb, 2020 tract vintage)
     try:
         feats = []
@@ -548,7 +519,6 @@ def get_radius_demographics(address: str, radii_miles: str = "1,3,5") -> dict:
         rings[f"{radius:g}_mile"] = ring
 
     return {
-        "address_matched": geo["matched_address"],
         "coordinates": {"lat": lat, "lng": lng},
         "acs_vintage": acs_vintage,
         "rings": rings,
@@ -560,6 +530,43 @@ def get_radius_demographics(address: str, radii_miles: str = "1,3,5") -> dict:
         ),
         "source": "US Census Bureau ACS 5-year + TIGERweb",
     }
+
+
+@mcp.tool()
+def get_radius_demographics(address: str, radii_miles: str = "1,3,5") -> dict:
+    """
+    Get aggregated Census demographics for radius rings around a US property address —
+    the standard 1/3/5-mile trade-area format used in CRE site analysis.
+    Aggregates every census tract whose centroid falls within each radius:
+    population, household-weighted median income, employment rate, college attainment,
+    housing vacancy, renter share, and median rent.
+
+    Use this for trade-area / site analysis. Use get_market_demographics for the
+    single census tract immediately around the address.
+
+    Args:
+        address:     Full US property address (e.g. "1234 Main St, Charlotte, NC 28202")
+        radii_miles: Comma-separated radii in miles (default "1,3,5", each capped at 15)
+    """
+    census_key = os.getenv("CENSUS_API_KEY", "")
+    if not census_key:
+        return {"error": "CENSUS_API_KEY not set. Free key at api.census.gov/data/key_signup.html"}
+
+    try:
+        radii = sorted({min(float(r.strip()), 15.0) for r in radii_miles.split(",") if float(r.strip()) > 0})[:4]
+    except Exception:
+        return {"error": "radii_miles must be comma-separated numbers, e.g. '1,3,5'"}
+    if not radii:
+        return {"error": "No valid radii provided."}
+
+    geo = geocode_address(address)
+    if "error" in geo:
+        return geo
+
+    result = _point_radius_demographics(geo["lat"], geo["lng"], radii, census_key)
+    if "error" in result:
+        return result
+    return {"address_matched": geo["matched_address"], **result}
 
 
 # ─── Tool 3: Inflation & Rent Growth Data ────────────────────────────────────
@@ -1145,7 +1152,52 @@ def _pct(s) -> Optional[float]:
         return None
 
 
-def _demo_analyze(address: str, noi: float, price: float) -> dict:
+def _market_grade(rings: dict) -> dict:
+    """Rule-of-thumb market quality grade from 3-mile ring demographics vs national medians."""
+    r3 = rings.get("3_mile") or rings.get("1_mile") or (next(iter(rings.values())) if rings else {})
+    hhi = r3.get("median_household_income")
+    emp = r3.get("employment_rate_pct")
+    vac = (r3.get("housing") or {}).get("vacancy_rate_pct")
+    if not hhi:
+        return {"grade": "N/A", "score": None}
+    score = 50.0
+    score += max(-25, min(25, (hhi / 78000 - 1) * 40))        # income vs ~US median HHI
+    if emp is not None:
+        score += max(-10, min(10, (emp - 95) * 2))             # employment strength
+    if vac is not None:
+        score += max(-10, min(10, (8 - vac) * 1.5))            # vacancy (lower is better)
+    for grade, floor_ in [("A", 68), ("A-", 62), ("B+", 56), ("B", 50), ("B-", 44), ("C+", 38), ("C", 30)]:
+        if score >= floor_:
+            return {"grade": grade, "score": round(score)}
+    return {"grade": "D", "score": round(score)}
+
+
+def _reverse_county_name(lat: float, lng: float) -> Optional[str]:
+    """Coordinates → 'County, ST' display name via Census reverse geocoder."""
+    try:
+        r = requests.get(
+            "https://geocoding.geo.census.gov/geocoder/geographies/coordinates",
+            params={
+                "x": lng, "y": lat,
+                "benchmark": "Public_AR_Census2020",
+                "vintage": "Census2020_Census2020",
+                "layers": "Counties,States",
+                "format": "json",
+            },
+            timeout=8,
+        )
+        g = r.json().get("result", {}).get("geographies", {})
+        county = (g.get("Counties") or [{}])[0].get("BASENAME")
+        state = (g.get("States") or [{}])[0].get("STUSAB")
+        if county and state:
+            return f"{county} County, {state}"
+    except Exception:
+        pass
+    return None
+
+
+def _demo_payload(rings_full: dict, display_name: str, noi: float, price: float) -> dict:
+    """Shared analysis payload: live rates + DCF + sensitivity + verdict + ring summary."""
     rates = _cached("rates", 3600, get_current_rates)
     sofr = rates.get("sofr", {}).get("rate_pct")
     t10 = rates.get("treasury_10yr", {}).get("rate_pct")
@@ -1155,10 +1207,6 @@ def _demo_analyze(address: str, noi: float, price: float) -> dict:
         loan_rate = round(t10 + 1.5, 2)
     else:
         loan_rate = 6.5
-
-    rings = _cached(f"rings:{address.lower()}", 86400, lambda: get_radius_demographics(address))
-    if "error" in rings:
-        return {"error": rings["error"]}
 
     base = build_dcf_model(noi_year1=noi, purchase_price=price, loan_rate=loan_rate)
     entry_cap = noi / price * 100
@@ -1187,8 +1235,10 @@ def _demo_analyze(address: str, noi: float, price: float) -> dict:
         verdict = "NO-GO"
         verdict_note = "Does not pencil at this basis with current market rates."
 
+    grade = _market_grade(rings_full.get("rings", {}))
+
     ring_summary = {}
-    for name, ring in rings.get("rings", {}).items():
+    for name, ring in rings_full.get("rings", {}).items():
         ring_summary[name] = {
             "population": ring.get("population"),
             "median_household_income": ring.get("median_household_income"),
@@ -1198,7 +1248,8 @@ def _demo_analyze(address: str, noi: float, price: float) -> dict:
         }
 
     return {
-        "address": rings.get("address_matched", address),
+        "address": display_name,
+        "market_grade": grade,
         "market": {
             "sofr_pct": sofr,
             "treasury_10yr_pct": t10,
@@ -1213,7 +1264,7 @@ def _demo_analyze(address: str, noi: float, price: float) -> dict:
             "spread_over_10yr_bps": round((entry_cap - t10) * 100) if t10 else None,
         },
         "returns": base["returns"],
-        "demographics": {"acs_vintage": rings.get("acs_vintage"), "rings": ring_summary},
+        "demographics": {"acs_vintage": rings_full.get("acs_vintage"), "rings": ring_summary},
         "sensitivity": {
             "noi_growth_pct": growth_steps,
             "exit_cap_pct": exit_steps,
@@ -1224,6 +1275,26 @@ def _demo_analyze(address: str, noi: float, price: float) -> dict:
         "verdict_note": verdict_note,
         "disclaimer": "Rule-of-thumb screen on live FRED/Census data — not investment advice. Full analysis: connect the MCP.",
     }
+
+
+def _demo_analyze(address: str, noi: float, price: float) -> dict:
+    rings_full = _cached(f"rings:{address.lower()}", 86400, lambda: get_radius_demographics(address))
+    if "error" in rings_full:
+        return {"error": rings_full["error"]}
+    return _demo_payload(rings_full, rings_full.get("address_matched", address), noi, price)
+
+
+def _demo_analyze_point(lat: float, lng: float, noi: float, price: float) -> dict:
+    census_key = os.getenv("CENSUS_API_KEY", "")
+    if not census_key:
+        return {"error": "Server misconfigured: CENSUS_API_KEY not set."}
+    key = f"rings:pt:{round(lat, 4)},{round(lng, 4)}"
+    rings_full = _cached(key, 86400, lambda: _point_radius_demographics(lat, lng, [1.0, 3.0, 5.0], census_key))
+    if "error" in rings_full:
+        return {"error": rings_full["error"]}
+    name = _cached(f"county:{round(lat, 3)},{round(lng, 3)}", 86400,
+                   lambda: _reverse_county_name(lat, lng)) or f"{lat:.4f}, {lng:.4f}"
+    return _demo_payload(rings_full, name, noi, price)
 
 
 @mcp.custom_route("/api/analyze", methods=["GET", "OPTIONS"])
@@ -1256,6 +1327,39 @@ async def api_analyze(request: Request) -> JSONResponse:
         )
 
     payload = await anyio.to_thread.run_sync(lambda: _demo_analyze(address, noi, price))
+    return JSONResponse(payload, status_code=400 if "error" in payload else 200, headers=_CORS_HEADERS)
+
+
+@mcp.custom_route("/api/analyze-point", methods=["GET", "OPTIONS"])
+async def api_analyze_point(request: Request) -> JSONResponse:
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_CORS_HEADERS)
+
+    client_ip = request.headers.get("x-forwarded-for", "")
+    if not client_ip and request.client:
+        client_ip = request.client.host
+    client_ip = client_ip.split(",")[0].strip() or "unknown"
+
+    if _rate_limited(client_ip):
+        return JSONResponse(
+            {"error": "Rate limit reached (8/min). Connect the MCP in Claude for unlimited access."},
+            status_code=429, headers=_CORS_HEADERS,
+        )
+
+    try:
+        lat = float(request.query_params.get("lat", ""))
+        lng = float(request.query_params.get("lng", ""))
+        noi = float(request.query_params.get("noi", ""))
+        price = float(request.query_params.get("price", ""))
+    except ValueError:
+        return JSONResponse({"error": "lat, lng, noi, price must be numbers"}, status_code=400, headers=_CORS_HEADERS)
+
+    if not (17.0 <= lat <= 72.0 and -180.0 <= lng <= -60.0):
+        return JSONResponse({"error": "Click somewhere in the United States."}, status_code=400, headers=_CORS_HEADERS)
+    if noi <= 0 or price <= 0 or noi >= price:
+        return JSONResponse({"error": "NOI must be > 0 and price > NOI."}, status_code=400, headers=_CORS_HEADERS)
+
+    payload = await anyio.to_thread.run_sync(lambda: _demo_analyze_point(lat, lng, noi, price))
     return JSONResponse(payload, status_code=400 if "error" in payload else 200, headers=_CORS_HEADERS)
 
 
