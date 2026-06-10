@@ -17,11 +17,13 @@ from datetime import date
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 import anthropic
+import anyio
 import requests
 import json
 import math
 import os
 import re
+import time
 import concurrent.futures
 
 load_dotenv()
@@ -1091,6 +1093,170 @@ Bulleted list of 3-5 specific risks for this deal.
 Keep it tight and professional. Every statistic must come from the provided data."""
 
     return ask_claude(deal_data, instructions, max_tokens=2500)
+
+
+# ─── Public demo API (landing page "Try it live") ────────────────────────────
+# Free-data only (FRED + Census) — no Claude calls, so zero marginal cost.
+# Per-IP rate limiting + short-TTL caching protect the upstream APIs.
+
+_RATE_BUCKET: dict = {}
+_API_CACHE: dict = {}
+
+_CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+}
+
+
+def _rate_limited(ip: str, limit: int = 8, window_s: int = 60) -> bool:
+    now = time.time()
+    hits = [t for t in _RATE_BUCKET.get(ip, []) if now - t < window_s]
+    if len(hits) >= limit:
+        _RATE_BUCKET[ip] = hits
+        return True
+    hits.append(now)
+    _RATE_BUCKET[ip] = hits
+    if len(_RATE_BUCKET) > 5000:
+        _RATE_BUCKET.clear()  # crude flush; fine for a demo endpoint
+    return False
+
+
+def _cached(key: str, ttl_s: int, fn):
+    now = time.time()
+    hit = _API_CACHE.get(key)
+    if hit and hit[0] > now:
+        return hit[1]
+    val = fn()
+    # Don't cache errors
+    if not (isinstance(val, dict) and "error" in val):
+        _API_CACHE[key] = (now + ttl_s, val)
+    if len(_API_CACHE) > 800:
+        for k in [k for k, v in list(_API_CACHE.items()) if v[0] <= now]:
+            _API_CACHE.pop(k, None)
+    return val
+
+
+def _pct(s) -> Optional[float]:
+    """Parse '13.2%' / '3.11x' style strings back to floats."""
+    try:
+        return float(str(s).rstrip("%x"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _demo_analyze(address: str, noi: float, price: float) -> dict:
+    rates = _cached("rates", 3600, get_current_rates)
+    sofr = rates.get("sofr", {}).get("rate_pct")
+    t10 = rates.get("treasury_10yr", {}).get("rate_pct")
+    if sofr:
+        loan_rate = round(sofr + 1.75, 2)
+    elif t10:
+        loan_rate = round(t10 + 1.5, 2)
+    else:
+        loan_rate = 6.5
+
+    rings = _cached(f"rings:{address.lower()}", 86400, lambda: get_radius_demographics(address))
+    if "error" in rings:
+        return {"error": rings["error"]}
+
+    base = build_dcf_model(noi_year1=noi, purchase_price=price, loan_rate=loan_rate)
+    entry_cap = noi / price * 100
+
+    # Sensitivity: IRR across exit cap (rows) x NOI growth (cols) — pure math, instant
+    growth_steps = [2.0, 2.5, 3.0, 3.5, 4.0]
+    exit_steps = [round(entry_cap + d, 2) for d in (-0.25, 0.0, 0.25, 0.5, 0.75)]
+    irr_grid = []
+    for ec in exit_steps:
+        row = []
+        for g in growth_steps:
+            d = build_dcf_model(noi_year1=noi, purchase_price=price, loan_rate=loan_rate,
+                                exit_cap_rate=ec, noi_growth_rate=g)
+            row.append(_pct(d["returns"]["irr"]))
+        irr_grid.append(row)
+
+    irr = _pct(base["returns"]["irr"])
+    dscr = base["returns"]["year1_dscr"]
+    if irr is not None and dscr is not None and irr >= 13 and dscr >= 1.25:
+        verdict = "GO"
+        verdict_note = "Clears a 13% IRR hurdle with adequate debt coverage — pending rent roll and comp diligence."
+    elif irr is not None and irr >= 10:
+        verdict = "MARGINAL"
+        verdict_note = "Returns are workable but thin — pricing or terms need to move."
+    else:
+        verdict = "NO-GO"
+        verdict_note = "Does not pencil at this basis with current market rates."
+
+    ring_summary = {}
+    for name, ring in rings.get("rings", {}).items():
+        ring_summary[name] = {
+            "population": ring.get("population"),
+            "median_household_income": ring.get("median_household_income"),
+            "renter_share_pct": (ring.get("housing") or {}).get("renter_share_pct"),
+            "median_gross_rent": ring.get("median_gross_rent"),
+            "tract_count": ring.get("tract_count"),
+        }
+
+    return {
+        "address": rings.get("address_matched", address),
+        "market": {
+            "sofr_pct": sofr,
+            "treasury_10yr_pct": t10,
+            "loan_rate_pct": loan_rate,
+            "loan_rate_basis": "SOFR + 175bps" if sofr else ("10yr T + 150bps" if t10 else "fallback"),
+            "as_of": rates.get("sofr", {}).get("date"),
+        },
+        "deal": {
+            "noi": noi,
+            "price": price,
+            "entry_cap_pct": round(entry_cap, 2),
+            "spread_over_10yr_bps": round((entry_cap - t10) * 100) if t10 else None,
+        },
+        "returns": base["returns"],
+        "demographics": {"acs_vintage": rings.get("acs_vintage"), "rings": ring_summary},
+        "sensitivity": {
+            "noi_growth_pct": growth_steps,
+            "exit_cap_pct": exit_steps,
+            "irr_grid": irr_grid,
+            "base_case": {"exit_cap_pct": exit_steps[1], "noi_growth_pct": 3.0},
+        },
+        "verdict": verdict,
+        "verdict_note": verdict_note,
+        "disclaimer": "Rule-of-thumb screen on live FRED/Census data — not investment advice. Full analysis: connect the MCP.",
+    }
+
+
+@mcp.custom_route("/api/analyze", methods=["GET", "OPTIONS"])
+async def api_analyze(request: Request) -> JSONResponse:
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_CORS_HEADERS)
+
+    client_ip = request.headers.get("x-forwarded-for", "")
+    if not client_ip and request.client:
+        client_ip = request.client.host
+    client_ip = client_ip.split(",")[0].strip() or "unknown"
+
+    if _rate_limited(client_ip):
+        return JSONResponse(
+            {"error": "Rate limit reached (8/min). Connect the MCP in Claude for unlimited access."},
+            status_code=429, headers=_CORS_HEADERS,
+        )
+
+    address = (request.query_params.get("address") or "").strip()[:200]
+    try:
+        noi = float(request.query_params.get("noi", ""))
+        price = float(request.query_params.get("price", ""))
+    except ValueError:
+        return JSONResponse({"error": "noi and price must be numbers"}, status_code=400, headers=_CORS_HEADERS)
+
+    if not address or noi <= 0 or price <= 0 or noi >= price:
+        return JSONResponse(
+            {"error": "Provide a full address, NOI > 0, and price > NOI. Format: '123 Main St, City, ST 12345'"},
+            status_code=400, headers=_CORS_HEADERS,
+        )
+
+    payload = await anyio.to_thread.run_sync(lambda: _demo_analyze(address, noi, price))
+    return JSONResponse(payload, status_code=400 if "error" in payload else 200, headers=_CORS_HEADERS)
 
 
 # ─── Health check ─────────────────────────────────────────────────────────────
