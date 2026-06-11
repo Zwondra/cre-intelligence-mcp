@@ -39,6 +39,7 @@ Zero data licensing fees. Zero hallucinations on financial inputs.
 | `flag_lease_risks` | Rent roll JSON → rollover risk, concentration risk, due diligence checklist | Claude AI |
 | `build_dcf_model` | Full levered 10-year DCF with live rates auto-fetched from FRED | Python + FRED |
 | `generate_deal_memo` | Address + NOI + price → full IC memo with live rates and demographics | Claude AI + FRED + Census |
+| `export_dcf_excel` | Downloadable .xlsx underwriting model with live formulas, sensitivity grid, market data | Python + FRED + Census |
 
 ---
 
