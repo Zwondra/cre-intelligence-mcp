@@ -1102,6 +1102,323 @@ Keep it tight and professional. Every statistic must come from the provided data
     return ask_claude(deal_data, instructions, max_tokens=2500)
 
 
+# ─── Tool 11: Export Excel Underwriting Model ────────────────────────────────
+
+_DOWNLOADS: dict = {}  # file_id -> (path, expires_at)
+
+
+def _generate_dcf_workbook(path: str, inputs: dict, rates: dict, sens: dict, rings_full: Optional[dict], property_name: str) -> None:
+    """Write a formula-driven .xlsx underwriting model (editable assumptions, live PMT/FV/IRR)."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Model"
+
+    TITLE = Font(bold=True, size=14, color="1D4ED8")
+    H = Font(bold=True, size=11)
+    HDR_FILL = PatternFill("solid", fgColor="1E293B")
+    HDR_FONT = Font(bold=True, color="FFFFFF", size=10)
+    INPUT = Font(color="2563EB", bold=True)  # blue = editable input (industry convention)
+    MUTED = Font(color="64748B", size=9)
+    THIN = Border(bottom=Side(style="thin", color="CBD5E1"))
+    MONEY = '#,##0'
+    PCT = '0.00%'
+
+    hold = inputs["hold_years"]
+
+    ws["A1"] = f"CRE INTELLIGENCE — DCF UNDERWRITING MODEL"
+    ws["A1"].font = TITLE
+    ws["A2"] = f"{property_name} · Generated {date.today().strftime('%B %d, %Y')} · Live Fed rates as of {rates.get('sofr', {}).get('date', 'n/a')} · cre-intelligence-mcp.vercel.app"
+    ws["A2"].font = MUTED
+
+    # ── Assumptions (blue cells are editable inputs) ──
+    ws["A4"] = "ASSUMPTIONS  (blue cells are inputs — edit freely)"
+    ws["A4"].font = H
+    rows = [
+        ("Purchase Price ($)", inputs["price"], MONEY),
+        ("Year 1 NOI ($)", inputs["noi"], MONEY),
+        ("NOI Growth (annual)", inputs["growth"] / 100, PCT),
+        ("Hold Period (years)", hold, '0'),
+        ("Exit Cap Rate", inputs["exit_cap"] / 100, PCT),
+        ("Equity (% of price)", inputs["equity_pct"] / 100, PCT),
+        ("Loan Interest Rate", inputs["loan_rate"] / 100, PCT),
+        ("Amortization (years)", inputs["amort"], '0'),
+    ]
+    for i, (label, val, fmt) in enumerate(rows, start=5):
+        ws[f"A{i}"] = label
+        ws[f"B{i}"] = val
+        ws[f"B{i}"].font = INPUT
+        ws[f"B{i}"].number_format = fmt
+
+    # ── Derived ──
+    ws["A14"] = "DERIVED"
+    ws["A14"].font = H
+    derived = [
+        ("Entry Cap Rate", "=B6/B5", PCT),
+        ("Equity ($)", "=B5*B10", MONEY),
+        ("Loan Amount ($)", "=B5-B16", MONEY),
+        ("Monthly Payment ($)", "=PMT(B11/12,B12*12,-B17)", MONEY),
+        ("Annual Debt Service ($)", "=B18*12", MONEY),
+    ]
+    for i, (label, formula, fmt) in enumerate(derived, start=15):
+        ws[f"A{i}"] = label
+        ws[f"B{i}"] = formula
+        ws[f"B{i}"].number_format = fmt
+
+    # ── Pro forma ──
+    hdr_row = 21
+    ws[f"A{hdr_row - 1}"] = "ANNUAL CASH FLOWS"
+    ws[f"A{hdr_row - 1}"].font = H
+    headers = ["Year", "NOI", "Debt Service", "Cash Flow", "DSCR", "Cash-on-Cash", "Loan Balance", "Equity CF"]
+    for c, name in enumerate(headers, start=1):
+        cell = ws.cell(row=hdr_row, column=c, value=name)
+        cell.fill = HDR_FILL
+        cell.font = HDR_FONT
+        cell.alignment = Alignment(horizontal="center")
+
+    yr0 = hdr_row + 1
+    ws.cell(row=yr0, column=1, value=0)
+    ws.cell(row=yr0, column=8, value="=-B16").number_format = MONEY
+
+    first = yr0 + 1
+    last = yr0 + hold
+    for k in range(1, hold + 1):
+        r = yr0 + k
+        ws.cell(row=r, column=1, value=k)
+        noi_cell = ws.cell(row=r, column=2)
+        noi_cell.value = "=B6" if k == 1 else f"=B{r - 1}*(1+$B$7)"
+        ws.cell(row=r, column=3, value="=$B$19")
+        ws.cell(row=r, column=4, value=f"=B{r}-C{r}")
+        ws.cell(row=r, column=5, value=f"=B{r}/C{r}").number_format = '0.00"x"'
+        ws.cell(row=r, column=6, value=f"=D{r}/$B$16").number_format = PCT
+        ws.cell(row=r, column=7, value=f"=FV($B$11/12,A{r}*12,$B$18,-$B$17)")
+        eq = ws.cell(row=r, column=8)
+        eq.value = f"=D{r}" if k < hold else f"=D{r}+$B${last + 6}"
+        for col, fmt in ((2, MONEY), (3, MONEY), (4, MONEY), (7, MONEY), (8, MONEY)):
+            ws.cell(row=r, column=col).number_format = fmt
+        for c in range(1, 9):
+            ws.cell(row=r, column=c).border = THIN
+
+    # ── Exit ──
+    ex = last + 3
+    ws[f"A{ex - 1}"] = "EXIT / REVERSION"
+    ws[f"A{ex - 1}"].font = H
+    exit_rows = [
+        (f"Exit NOI (Year {hold + 1})", f"=B{last}*(1+$B$7)", MONEY),
+        ("Gross Sale Value", f"=B{ex}/$B$9", MONEY),
+        ("Loan Payoff", f"=G{last}", MONEY),
+        ("Net Sale Proceeds", f"=B{ex + 1}-B{ex + 2}", MONEY),
+    ]
+    for i, (label, formula, fmt) in enumerate(exit_rows):
+        ws[f"A{ex + i}"] = label
+        ws[f"B{ex + i}"] = formula
+        ws[f"B{ex + i}"].number_format = fmt
+
+    # ── Returns ──
+    rt = ex + 6
+    ws[f"A{rt - 1}"] = "RETURNS"
+    ws[f"A{rt - 1}"].font = H
+    ret_rows = [
+        ("IRR (levered)", f"=IRR(H{yr0}:H{last})", PCT),
+        ("Equity Multiple", f"=SUM(H{first}:H{last})/B16", '0.00"x"'),
+        ("Average Cash-on-Cash", f"=AVERAGE(F{first}:F{last})", PCT),
+        ("Year 1 DSCR", f"=E{first}", '0.00"x"'),
+    ]
+    for i, (label, formula, fmt) in enumerate(ret_rows):
+        ws[f"A{rt + i}"] = label
+        cell = ws[f"B{rt + i}"]
+        cell.value = formula
+        cell.number_format = fmt
+        cell.font = Font(bold=True, color="16A34A")
+
+    ws.column_dimensions["A"].width = 26
+    for c in range(2, 9):
+        ws.column_dimensions[get_column_letter(c)].width = 14
+
+    # ── Sensitivity sheet (values computed at generation) ──
+    s = wb.create_sheet("Sensitivity")
+    s["A1"] = "IRR SENSITIVITY — exit cap rate × NOI growth"
+    s["A1"].font = TITLE
+    s["A2"] = "Computed at generation from the Model assumptions. Edit the Model sheet for live what-ifs."
+    s["A2"].font = MUTED
+    s["A4"] = "Exit Cap ↓ / Growth →"
+    s["A4"].font = HDR_FONT
+    s["A4"].fill = HDR_FILL
+    for j, g in enumerate(sens["noi_growth_pct"]):
+        cell = s.cell(row=4, column=2 + j, value=g / 100)
+        cell.number_format = PCT
+        cell.fill = HDR_FILL
+        cell.font = HDR_FONT
+    for i, ec in enumerate(sens["exit_cap_pct"]):
+        cell = s.cell(row=5 + i, column=1, value=ec / 100)
+        cell.number_format = PCT
+        cell.font = H
+        for j in range(len(sens["noi_growth_pct"])):
+            v = sens["irr_grid"][i][j]
+            c = s.cell(row=5 + i, column=2 + j, value=(v / 100) if v is not None else None)
+            c.number_format = PCT
+    s.column_dimensions["A"].width = 22
+
+    # ── Market data sheet ──
+    m = wb.create_sheet("Market Data")
+    m["A1"] = "LIVE MARKET DATA — Federal Reserve (FRED)"
+    m["A1"].font = TITLE
+    r = 3
+    for key, label in [("sofr", "SOFR"), ("sofr_30day_avg", "SOFR 30-day avg"), ("treasury_10yr", "10yr Treasury"),
+                       ("treasury_5yr", "5yr Treasury"), ("treasury_2yr", "2yr Treasury"), ("fed_funds_rate", "Fed Funds (daily)")]:
+        d = rates.get(key, {})
+        if isinstance(d, dict) and d.get("rate_pct") is not None:
+            m[f"A{r}"] = label
+            m[f"B{r}"] = d["rate_pct"] / 100
+            m[f"B{r}"].number_format = PCT
+            m[f"C{r}"] = f"as of {d.get('date')}"
+            m[f"C{r}"].font = MUTED
+            r += 1
+    if rings_full and rings_full.get("rings"):
+        r += 2
+        m[f"A{r}"] = "TRADE-AREA DEMOGRAPHICS — US Census ACS " + str(rings_full.get("acs_vintage", ""))
+        m[f"A{r}"].font = H
+        r += 1
+        for c, name in enumerate(["Ring", "Population", "Median HHI", "Renter %", "Median Rent", "Tracts"], start=1):
+            cell = m.cell(row=r, column=c, value=name)
+            cell.fill = HDR_FILL
+            cell.font = HDR_FONT
+        for ring_name, ring in rings_full["rings"].items():
+            r += 1
+            m.cell(row=r, column=1, value=ring_name.replace("_", " "))
+            m.cell(row=r, column=2, value=ring.get("population")).number_format = MONEY
+            m.cell(row=r, column=3, value=ring.get("median_household_income")).number_format = MONEY
+            rs = (ring.get("housing") or {}).get("renter_share_pct")
+            m.cell(row=r, column=4, value=(rs / 100) if rs is not None else None).number_format = PCT
+            m.cell(row=r, column=5, value=ring.get("median_gross_rent")).number_format = MONEY
+            m.cell(row=r, column=6, value=ring.get("tract_count"))
+    m.column_dimensions["A"].width = 24
+    for c in range(2, 7):
+        m.column_dimensions[get_column_letter(c)].width = 14
+
+    wb.save(path)
+
+
+@mcp.tool()
+def export_dcf_excel(
+    noi_year1: float,
+    purchase_price: float,
+    address: Optional[str] = None,
+    property_name: Optional[str] = None,
+    hold_years: int = 10,
+    noi_growth_rate: float = 3.0,
+    exit_cap_rate: Optional[float] = None,
+    equity_pct: float = 35.0,
+    loan_rate: Optional[float] = None,
+    amortization_years: int = 30,
+) -> dict:
+    """
+    Generate a downloadable Excel (.xlsx) underwriting model with LIVE formulas —
+    editable assumptions, PMT/FV amortization, IRR, equity multiple, a sensitivity
+    grid, live Fed rates, and (if an address is given) Census trade-area demographics.
+    Returns a download link valid for 60 minutes.
+
+    Args:
+        noi_year1:          Year 1 Net Operating Income ($)
+        purchase_price:     Acquisition price ($)
+        address:            Optional property address — adds a demographics sheet
+        property_name:      Optional label for the model header
+        hold_years:         Hold period (default 10)
+        noi_growth_rate:    Annual NOI growth % (default 3.0)
+        exit_cap_rate:      Exit cap % — default entry cap + 25bps
+        equity_pct:         Equity as % of price (default 35)
+        loan_rate:          Loan rate % — default live SOFR + 175bps
+        amortization_years: Amortization (default 30)
+    """
+    import uuid
+
+    rates = _cached("rates", 3600, get_current_rates)
+    if loan_rate is None:
+        sofr = rates.get("sofr", {}).get("rate_pct")
+        t10 = rates.get("treasury_10yr", {}).get("rate_pct")
+        loan_rate = round(sofr + 1.75, 2) if sofr else (round(t10 + 1.5, 2) if t10 else 6.5)
+
+    entry_cap = noi_year1 / purchase_price * 100
+    if exit_cap_rate is None:
+        exit_cap_rate = round(entry_cap + 0.25, 2)
+
+    # Sensitivity grid (reuses the DCF engine)
+    growth_steps = [2.0, 2.5, 3.0, 3.5, 4.0]
+    exit_steps = [round(entry_cap + d, 2) for d in (-0.25, 0.0, 0.25, 0.5, 0.75)]
+    irr_grid = []
+    for ec in exit_steps:
+        row = []
+        for g in growth_steps:
+            d = build_dcf_model(noi_year1=noi_year1, purchase_price=purchase_price, loan_rate=loan_rate,
+                                exit_cap_rate=ec, noi_growth_rate=g, hold_years=hold_years,
+                                equity_pct=equity_pct, amortization_years=amortization_years)
+            row.append(_pct(d["returns"]["irr"]))
+        irr_grid.append(row)
+    sens = {"noi_growth_pct": growth_steps, "exit_cap_pct": exit_steps, "irr_grid": irr_grid}
+
+    rings_full = None
+    display = property_name or "Untitled Property"
+    if address:
+        rings_full = _cached(f"rings:{address.lower()}", 86400, lambda: get_radius_demographics(address))
+        if "error" in rings_full:
+            rings_full = None
+        elif not property_name:
+            display = rings_full.get("address_matched", address)
+
+    file_id = uuid.uuid4().hex[:12]
+    path = f"/tmp/cre_model_{file_id}.xlsx"
+    _generate_dcf_workbook(
+        path,
+        {"price": purchase_price, "noi": noi_year1, "growth": noi_growth_rate, "hold_years": hold_years,
+         "exit_cap": exit_cap_rate, "equity_pct": equity_pct, "loan_rate": loan_rate, "amort": amortization_years},
+        rates, sens, rings_full, display,
+    )
+    _DOWNLOADS[file_id] = (path, time.time() + 3600)
+
+    base = os.getenv("PUBLIC_BASE_URL", "https://cre-intelligence-mcp.onrender.com")
+    headline = build_dcf_model(noi_year1=noi_year1, purchase_price=purchase_price, loan_rate=loan_rate,
+                               exit_cap_rate=exit_cap_rate, noi_growth_rate=noi_growth_rate,
+                               hold_years=hold_years, equity_pct=equity_pct, amortization_years=amortization_years)
+
+    return {
+        "download_url": f"{base}/download/{file_id}",
+        "filename": f"cre_model_{file_id}.xlsx",
+        "expires_in_minutes": 60,
+        "model": {
+            "property": display,
+            "entry_cap": f"{entry_cap:.2f}%",
+            "loan_rate_used": f"{loan_rate:.2f}% (live SOFR + 175bps)" if loan_rate else None,
+            "returns_preview": headline["returns"],
+        },
+        "sheets": ["Model (live formulas — edit blue cells)", "Sensitivity (IRR grid)", "Market Data (live FRED + Census)"],
+        "note": "Open in Excel or Google Sheets. All assumptions are editable; IRR/DSCR/amortization recalculate live.",
+    }
+
+
+@mcp.custom_route("/download/{file_id}", methods=["GET"])
+async def download_file(request: Request):
+    from starlette.responses import FileResponse
+
+    now = time.time()
+    for fid, (p, exp) in list(_DOWNLOADS.items()):
+        if exp < now:
+            _DOWNLOADS.pop(fid, None)
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+    file_id = request.path_params["file_id"]
+    entry = _DOWNLOADS.get(file_id)
+    if not entry or not os.path.exists(entry[0]):
+        return JSONResponse({"error": "File expired or not found. Generate a fresh model."}, status_code=404)
+    return FileResponse(entry[0], filename="cre_underwriting_model.xlsx",
+                        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
 # ─── Public demo API (landing page "Try it live") ────────────────────────────
 # Free-data only (FRED + Census) — no Claude calls, so zero marginal cost.
 # Per-IP rate limiting + short-TTL caching protect the upstream APIs.
