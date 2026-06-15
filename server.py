@@ -569,6 +569,133 @@ def get_radius_demographics(address: str, radii_miles: str = "1,3,5") -> dict:
     return {"address_matched": geo["matched_address"], **result}
 
 
+# ─── Tool 2c: Land Market Screener (for land investing) ──────────────────────
+
+STATE_FIPS = {
+    "AL": "01", "AK": "02", "AZ": "04", "AR": "05", "CA": "06", "CO": "08", "CT": "09",
+    "DE": "10", "DC": "11", "FL": "12", "GA": "13", "HI": "15", "ID": "16", "IL": "17",
+    "IN": "18", "IA": "19", "KS": "20", "KY": "21", "LA": "22", "ME": "23", "MD": "24",
+    "MA": "25", "MI": "26", "MN": "27", "MS": "28", "MO": "29", "MT": "30", "NE": "31",
+    "NV": "32", "NH": "33", "NJ": "34", "NM": "35", "NY": "36", "NC": "37", "ND": "38",
+    "OH": "39", "OK": "40", "OR": "41", "PA": "42", "RI": "44", "SC": "45", "SD": "46",
+    "TN": "47", "TX": "48", "UT": "49", "VT": "50", "VA": "51", "WA": "53", "WV": "54",
+    "WI": "55", "WY": "56",
+}
+
+
+@mcp.tool()
+def screen_land_market(state: str, county: str) -> dict:
+    """
+    Screen a US county as a LAND-INVESTING market (raw-land flip / Podolsky style).
+    Grades the county on the signals that matter for buying cheap rural land and
+    reselling on terms: population growth, demographics, owner share, and affordability.
+
+    IMPORTANT: This screens on FREE Census data only (growth + demographics + a
+    home-value affordability proxy). It does NOT include actual land sale prices or
+    comps — those require county records or a paid service, and must be verified
+    per-parcel before buying. Use this to rank/shortlist markets, not to buy.
+
+    Args:
+        state:  2-letter state abbreviation (e.g. "AZ") or 2-digit state FIPS
+        county: County name (e.g. "Mohave" or "Mohave County")
+    """
+    census_key = os.getenv("CENSUS_API_KEY", "")
+    if not census_key:
+        return {"error": "CENSUS_API_KEY not set."}
+
+    st = state.strip().upper()
+    st_fips = STATE_FIPS.get(st) or (st if st.isdigit() and len(st) == 2 else None)
+    if not st_fips:
+        return {"error": f"Unknown state '{state}'. Use a 2-letter abbreviation like 'AZ'."}
+
+    target = county.strip().lower().replace(" county", "")
+    variables = "NAME,B01003_001E,B19013_001E,B25077_001E,B25003_001E,B25003_002E"
+
+    try:
+        r = requests.get(
+            "https://api.census.gov/data/2023/acs/acs5",
+            params={"get": variables, "for": "county:*", "in": f"state:{st_fips}", "key": census_key},
+            timeout=20,
+        )
+        if r.status_code != 200:
+            return {"error": f"Census query failed ({r.status_code})."}
+        rows = r.json()
+        hdr = rows[0]
+        match = None
+        for row in rows[1:]:
+            rec = dict(zip(hdr, row))
+            if target in rec["NAME"].lower():
+                match = rec
+                break
+        if not match:
+            return {"error": f"County '{county}' not found in {st}. Try just the county name, e.g. 'Mohave'."}
+
+        co_fips = match["county"]
+
+        r19 = requests.get(
+            "https://api.census.gov/data/2019/acs/acs5",
+            params={"get": "B01003_001E", "for": f"county:{co_fips}", "in": f"state:{st_fips}", "key": census_key},
+            timeout=15,
+        )
+        p19 = int(r19.json()[1][0]) if r19.status_code == 200 else None
+
+        def _i(v):
+            try:
+                n = int(match.get(v))
+                return None if n < 0 else n
+            except (TypeError, ValueError):
+                return None
+
+        pop = _i("B01003_001E")
+        inc = _i("B19013_001E")
+        hval = _i("B25077_001E")
+        tenure = _i("B25003_001E")
+        owners = _i("B25003_002E")
+        owner_pct = round(owners / tenure * 100, 1) if owners and tenure else None
+        growth = round((pop - p19) / p19 * 100, 1) if pop and p19 else None
+
+        # Transparent screening heuristic (0-100). Growth weighted highest; cheaper = better for 25c buys.
+        score = 50.0
+        if growth is not None:
+            score += max(-15, min(20, growth * 2.5))
+        if hval:
+            score += max(-12, min(12, (300000 - hval) / 300000 * 12))
+        if owner_pct is not None:
+            score += max(-8, min(8, (owner_pct - 55) * 0.4))
+        if inc:
+            score += max(-6, min(6, (inc - 45000) / 45000 * 6))
+        score = round(max(0, min(100, score)))
+        grade = ("A" if score >= 72 else "A-" if score >= 66 else "B+" if score >= 60
+                 else "B" if score >= 52 else "C+" if score >= 44 else "C" if score >= 36 else "D")
+
+        bits = []
+        if growth is not None:
+            bits.append(f"{'strong' if growth >= 4 else 'modest' if growth >= 1.5 else 'flat/declining'} growth ({growth:+.1f}% 2019-2023)")
+        if hval:
+            bits.append(f"{'affordable' if hval < 250000 else 'mid-priced' if hval < 400000 else 'expensive'} (median home ${hval:,})")
+        if owner_pct is not None:
+            bits.append(f"{owner_pct:.0f}% owner-occupied")
+
+        return {
+            "county": match["NAME"],
+            "fips": f"{st_fips}{co_fips}",
+            "land_market_score": score,
+            "grade": grade,
+            "read": "; ".join(bits) + ".",
+            "signals": {
+                "population": pop,
+                "population_growth_2019_2023_pct": growth,
+                "median_household_income": inc,
+                "median_home_value_proxy": hval,
+                "owner_occupancy_pct": owner_pct,
+            },
+            "next_step": "Verify cheap parcels actually exist here (LandWatch / Land.com / county records) and run per-parcel due diligence. This screen ranks markets; it does not price land.",
+            "source": "US Census Bureau ACS 5-year (2019 & 2023)",
+        }
+    except Exception as e:
+        return {"error": f"Land market screen failed: {str(e)}"}
+
+
 # ─── Tool 3: Inflation & Rent Growth Data ────────────────────────────────────
 
 @mcp.tool()
