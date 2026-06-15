@@ -696,6 +696,90 @@ def screen_land_market(state: str, county: str) -> dict:
         return {"error": f"Land market screen failed: {str(e)}"}
 
 
+# ─── Tool 2d: Parcel DD Pre-Screen (land due diligence) ──────────────────────
+
+@mcp.tool()
+def screen_parcel_dd(lat: float, lng: float) -> dict:
+    """
+    Pre-screen a land parcel's location for the AUTOMATABLE due-diligence red flags:
+    FEMA flood zone and federal wetlands. Pulls live from FEMA's National Flood Hazard
+    Layer and the US Fish & Wildlife National Wetlands Inventory.
+
+    Use this to kill obviously-bad parcels (flood zone, wetlands) at scale BEFORE
+    spending time on manual due diligence.
+
+    IMPORTANT: Checks flood + wetlands only. It does NOT check legal ACCESS
+    (landlocked — the #1 land deal-killer), title/liens, or zoning — those stay MANUAL,
+    per-parcel checks via county records. A clean screen here is necessary, NOT sufficient.
+
+    Args:
+        lat: Parcel latitude (decimal degrees)
+        lng: Parcel longitude (decimal degrees)
+    """
+    flags = []
+    out = {"coordinates": {"lat": lat, "lng": lng}}
+
+    # ── FEMA flood zone ──
+    try:
+        r = requests.get(
+            "https://hazards.fema.gov/arcgis/rest/services/public/NFHL/MapServer/28/query",
+            params={"geometry": f"{lng},{lat}", "geometryType": "esriGeometryPoint", "inSR": "4326",
+                    "spatialRel": "esriSpatialRelIntersects", "outFields": "FLD_ZONE,ZONE_SUBTY",
+                    "returnGeometry": "false", "f": "json"},
+            timeout=15,
+        )
+        feats = r.json().get("features", [])
+        if feats:
+            z = feats[0]["attributes"].get("FLD_ZONE")
+            sub = feats[0]["attributes"].get("ZONE_SUBTY")
+            high = z in ("A", "AE", "AH", "AO", "AR", "A99", "V", "VE")
+            out["flood"] = {"zone": z, "detail": sub, "risk": "HIGH" if high else "low/minimal"}
+            if high:
+                flags.append(f"FLOOD — Zone {z} (high-risk floodplain): tanks value and buildability")
+        else:
+            out["flood"] = {"zone": "X (likely)", "detail": "No mapped flood hazard at this point", "risk": "low/minimal"}
+    except Exception as e:
+        out["flood"] = {"error": f"FEMA check failed: {str(e)}"}
+
+    # ── USFWS National Wetlands Inventory ──
+    try:
+        r = requests.get(
+            "https://fwspublicservices.wim.usgs.gov/wetlandsmapservice/rest/services/Wetlands/MapServer/0/query",
+            params={"geometry": f"{lng},{lat}", "geometryType": "esriGeometryPoint", "inSR": "4326",
+                    "spatialRel": "esriSpatialRelIntersects", "outFields": "*",
+                    "returnGeometry": "false", "f": "json"},
+            timeout=15,
+        )
+        feats = r.json().get("features", [])
+        if feats:
+            attrs = feats[0]["attributes"]
+            wt = next((v for k, v in attrs.items() if k.endswith("WETLAND_TYPE")), "Wetland")
+            out["wetlands"] = {"present": True, "type": wt}
+            flags.append(f"WETLAND — '{wt}' mapped on the parcel: likely unbuildable/unusable")
+        else:
+            out["wetlands"] = {"present": False, "type": None}
+    except Exception as e:
+        out["wetlands"] = {"error": f"Wetlands check failed: {str(e)}"}
+
+    out["red_flags"] = flags
+    errored = [k for k in ("flood", "wetlands") if "error" in out.get(k, {})]
+    if errored:
+        out["verdict"] = (f"⚠️ {' & '.join(errored)} check FAILED — do NOT treat as clean, recheck manually"
+                          + (" (plus red flags found below)" if flags else ""))
+    elif flags:
+        out["verdict"] = "RED FLAGS — investigate hard or pass"
+    else:
+        out["verdict"] = "No flood/wetland red flags — but still verify access, title & zoning manually"
+    out["manual_dd_still_required"] = [
+        "Legal ACCESS — is it landlocked? (#1 deal-killer — check county GIS / plat map)",
+        "Title & liens — county recorder + title search",
+        "Zoning & allowed use — county zoning department",
+        "Exact back taxes owed — county treasurer",
+    ]
+    out["source"] = "FEMA NFHL + US Fish & Wildlife National Wetlands Inventory (free public data)"
+    return out
+
+
 # ─── Tool 3: Inflation & Rent Growth Data ────────────────────────────────────
 
 @mcp.tool()
